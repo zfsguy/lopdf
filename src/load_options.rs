@@ -49,6 +49,16 @@ pub struct LoadOptions {
     ///
     /// `None` (the default) applies no limit.
     pub max_decompressed_size: Option<usize>,
+    /// When `true`, leave every stream's bytes in the source and load only its
+    /// dictionary; [`crate::Stream::start_position`] records where the bytes
+    /// are, and [`crate::Document::read_stream_content`] reads them on demand.
+    ///
+    /// A document's structure is a small part of a file whose streams hold
+    /// images or embedded data, so this loads such a file without holding its
+    /// payloads. Object streams and cross-reference streams are always loaded;
+    /// they carry the structure. Encrypted documents are not supported.
+    /// Defaults to `false`.
+    pub defer_stream_content: bool,
 }
 
 impl std::fmt::Debug for LoadOptions {
@@ -58,6 +68,7 @@ impl std::fmt::Debug for LoadOptions {
             .field("filter", &self.filter.map(|_| "fn(..)"))
             .field("strict", &self.strict)
             .field("max_decompressed_size", &self.max_decompressed_size)
+            .field("defer_stream_content", &self.defer_stream_content)
             .finish()
     }
 }
@@ -85,6 +96,16 @@ impl LoadOptions {
     pub fn with_max_decompressed_size(max_decompressed_size: usize) -> Self {
         Self {
             max_decompressed_size: Some(max_decompressed_size),
+            ..Default::default()
+        }
+    }
+
+    /// Create options that leave stream bytes in the source, to be read on
+    /// demand with [`crate::Document::read_stream_content`]. See
+    /// [`LoadOptions::defer_stream_content`].
+    pub fn with_deferred_stream_content() -> Self {
+        Self {
+            defer_stream_content: true,
             ..Default::default()
         }
     }

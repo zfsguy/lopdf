@@ -393,8 +393,13 @@ fn stream<'a>(
         let Ok(length) = usize::try_from(length) else {
             return Err(nom::Err::Failure(NomError::from_error_kind(i, ErrorKind::LengthValue)));
         };
+        // Relative to the start of the stream dictionary; `offset_stream` makes it absolute.
+        let position = input.len() - i.len();
         match terminated(take(length), pair(opt(eol), tag(&b"endstream"[..]))).parse(i) {
-            Ok((remaining, data)) => Ok((remaining, Object::Stream(Stream::new(dict, data.to_vec())))),
+            Ok((remaining, _)) if reader.defer_stream_content && !holds_structure(&dict) => {
+                Ok((remaining, Object::Stream(Stream::with_position(dict, position))))
+            }
+            Ok((remaining, data)) => Ok((remaining, Object::Stream(loaded_stream(dict, data, position)))),
             Err(_) if recover_length && !reader.strict => {
                 // The scan must not cross into a neighbouring object, so it stops at the
                 // xref-derived bound: the first `i.len() - bound` bytes of `i`.
@@ -406,7 +411,8 @@ fn stream<'a>(
                     "Stream Length is {length}, but the unambiguous object boundary gives {} bytes; using the recovered length.",
                     data.len()
                 );
-                Ok((remaining, Object::Stream(Stream::new(dict, data.to_vec()))))
+                // A recovered stream is never deferred: only its loaded bytes know its length.
+                Ok((remaining, Object::Stream(loaded_stream(dict, data, position))))
             }
             Err(_) => Err(nom::Err::Failure(NomError::from_error_kind(i, ErrorKind::LengthValue))),
         }
@@ -414,6 +420,21 @@ fn stream<'a>(
         // Return position relative to the start of the stream dictionary.
         Ok((i, Object::Stream(Stream::with_position(dict, input.len() - i.len()))))
     }
+}
+
+/// A stream parsed from `data` at `position`, its bytes loaded and its `/Length`
+/// set from them.
+fn loaded_stream(dict: Dictionary, data: &[u8], position: usize) -> Stream {
+    Stream {
+        start_position: Some(position),
+        ..Stream::new(dict, data.to_vec())
+    }
+}
+
+/// Object streams and cross-reference streams are decoded while the document
+/// loads, so their bytes are never left in the source.
+fn holds_structure(dict: &Dictionary) -> bool {
+    dict.has_type(b"ObjStm") || dict.has_type(b"XRef")
 }
 
 fn unsigned_int<I: FromStr>(input: ParserInput) -> NomResult<I> {

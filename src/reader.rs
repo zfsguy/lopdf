@@ -351,6 +351,10 @@ pub struct Reader<'a> {
     /// `None` (the default) applies no limit; set it to guard against
     /// decompression bombs. See [`crate::LoadOptions`].
     pub max_decompressed_size: Option<usize>,
+    /// Leave stream bytes in the buffer, recorded by `start_position`, instead
+    /// of copying them into each stream; object streams and cross-reference
+    /// streams are loaded regardless. See [`crate::LoadOptions`].
+    pub defer_stream_content: bool,
     /// Sorted unique byte offsets of every `XrefEntry::Normal` entry in the
     /// final cross-reference table. Built once when the table is complete so
     /// object-boundary lookups can binary-search the successor offset instead
@@ -486,6 +490,7 @@ impl<'a> Reader<'a> {
             password: options.password,
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
+            defer_stream_content: options.defer_stream_content,
             normal_offsets: Vec::new(),
             object_streams: Mutex::default(),
         }
@@ -719,6 +724,11 @@ impl<'a> Reader<'a> {
         // Check if encrypted
         let is_encrypted = self.document.trailer.get(b"Encrypt").is_ok();
 
+        // Decryption rewrites stream bytes in memory; bytes left in the buffer would stay encrypted.
+        if is_encrypted && self.defer_stream_content {
+            return Err(Error::Unimplemented("deferred stream content of an encrypted document"));
+        }
+
         if is_encrypted {
             // For encrypted PDFs, use a special loading strategy
             self.load_encrypted_document(filter_func)?;
@@ -938,7 +948,9 @@ impl<'a> Reader<'a> {
                                     .is_none_or(|&c| c == container_id)
                             }));
                         }
-                    } else if stream.content.is_empty() {
+                    } else if stream.content.is_empty() && !self.defer_stream_content {
+                        // The parser could not size this stream yet; it is read once every
+                        // `/Length` object is loaded. A deferred stream stays empty by design.
                         let mut zero_length_streams = zero_length_streams.lock().unwrap();
                         zero_length_streams.push(object_id);
                     }
@@ -986,54 +998,13 @@ impl<'a> Reader<'a> {
     }
 
     fn read_stream_content(&mut self, object_id: ObjectId) -> Result<()> {
-        let length = self.get_stream_length(object_id)?;
+        let content = self.document.read_stream_content(self.buffer, object_id)?;
         let stream = self
             .document
             .get_object_mut(object_id)
             .and_then(Object::as_stream_mut)?;
-        let start = stream
-            .start_position
-            .ok_or(Error::InvalidStream("missing start position".to_string()))?;
-
-        if length < 0 {
-            return Err(Error::InvalidStream("negative stream length.".to_string()));
-        }
-
-        let length = usize::try_from(length).map_err(|e| Error::NumericCast(e.to_string()))?;
-        let end = start + length;
-
-        if end > self.buffer.len() {
-            return Err(Error::InvalidStream("stream extends after document end.".to_string()));
-        }
-
-        stream.set_content(self.buffer[start..end].to_vec());
+        stream.set_content(content);
         Ok(())
-    }
-
-    fn get_stream_length(&self, object_id: ObjectId) -> Result<i64> {
-        let object = self.document.get_object(object_id)?;
-        let stream = object.as_stream()?;
-        stream
-            .dict
-            .get(b"Length")
-            .and_then(|value| self.document.dereference(value))
-            .and_then(|(_id, obj)| match obj.as_i64() {
-                Ok(length) => Ok(length),
-                // s7.3.8.2 requires an integer /Length, but some producers write a real ("42.");
-                // accept one whose value is integral and in range.
-                Err(err) => match obj.as_f32() {
-                    Ok(value) if value.fract() == 0.0 && value >= -(2f32.powi(63)) && value < 2f32.powi(63) => {
-                        Ok(value as i64)
-                    }
-                    _ => Err(err),
-                },
-            })
-            .inspect_err(|_err| {
-                error!(
-                    "stream dictionary of '{} {} R' is missing the Length entry",
-                    object_id.0, object_id.1
-                );
-            })
     }
 
     /// Get object offset by object ID.
@@ -1604,6 +1575,63 @@ impl<'a> Reader<'a> {
             .windows(pattern.len())
             .rposition(|window| window == pattern)
             .map(|pos| start_pos + pos)
+    }
+}
+
+impl Document {
+    /// Read the bytes of stream `id` from `buffer`, the source this document was
+    /// loaded from: `/Length` bytes from the stream's `start_position`.
+    ///
+    /// This is how a stream left in the source by
+    /// [`LoadOptions::defer_stream_content`] is read on demand; after an
+    /// ordinary load it re-reads a stream the same way. The bytes come back as
+    /// stored, filters still applied. A stream this document did not parse from
+    /// `buffer`, one built with [`crate::Stream::new`], has no position and is an
+    /// error.
+    pub fn read_stream_content(&self, buffer: &[u8], id: ObjectId) -> Result<Vec<u8>> {
+        let length = self.stream_length(id)?;
+        let stream = self.get_object(id)?.as_stream()?;
+        let start = stream
+            .start_position
+            .ok_or(Error::InvalidStream("missing start position".to_string()))?;
+
+        if length < 0 {
+            return Err(Error::InvalidStream("negative stream length.".to_string()));
+        }
+
+        let length = usize::try_from(length).map_err(|e| Error::NumericCast(e.to_string()))?;
+        let end = start
+            .checked_add(length)
+            .filter(|&end| end <= buffer.len())
+            .ok_or_else(|| Error::InvalidStream("stream extends after document end.".to_string()))?;
+
+        Ok(buffer[start..end].to_vec())
+    }
+
+    fn stream_length(&self, object_id: ObjectId) -> Result<i64> {
+        let object = self.get_object(object_id)?;
+        let stream = object.as_stream()?;
+        stream
+            .dict
+            .get(b"Length")
+            .and_then(|value| self.dereference(value))
+            .and_then(|(_id, obj)| match obj.as_i64() {
+                Ok(length) => Ok(length),
+                // s7.3.8.2 requires an integer /Length, but some producers write a real ("42.");
+                // accept one whose value is integral and in range.
+                Err(err) => match obj.as_f32() {
+                    Ok(value) if value.fract() == 0.0 && value >= -(2f32.powi(63)) && value < 2f32.powi(63) => {
+                        Ok(value as i64)
+                    }
+                    _ => Err(err),
+                },
+            })
+            .inspect_err(|_err| {
+                error!(
+                    "stream dictionary of '{} {} R' is missing the Length entry",
+                    object_id.0, object_id.1
+                );
+            })
     }
 }
 
